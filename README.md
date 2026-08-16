@@ -43,7 +43,7 @@ The app detects this automatically — no manual configuration needed.
 4. Install the APK on your phone (enable "Install unknown apps" for your file
    manager). The release APK is unsigned but installs fine on any phone.
 
-The workflow file is `.github/workflows/build-apk.yml`. It needs no secrets.
+The workflow file is `.github/workflows/build.yml`. It needs no secrets.
 
 ## Build locally with Android Studio (alternative)
 
