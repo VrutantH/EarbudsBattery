@@ -3,18 +3,20 @@ package com.vrutant.earbudsbattery
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.util.UUID
 
 /**
  * Thin wrapper around Android's BluetoothGatt APIs.
  *
- * Notes on the "why" here, since TWS earbuds don't use standard GATT battery
- * services: most vendors (Realme/OPPO/OnePlus included) expose battery data
- * through a proprietary service + characteristic. This class doesn't assume
- * any UUIDs — it just gives you generic connect / discover / read / subscribe
- * primitives so the Explorer screen can find the right one, and the Dashboard
- * screen can use it once you've identified it.
+ * TWS earbuds from the BBK ecosystem (realme/OPPO/OnePlus) use the OPO v1
+ * protocol: you must WRITE handshake/query commands to a command
+ * characteristic, and battery replies arrive as notifications on a separate
+ * characteristic. Older realme buds push battery bytes without any query.
+ * This class therefore exposes generic connect / discover / read / write /
+ * subscribe primitives so both behaviours can be handled by the UI layer.
  */
 class BleClient(private val context: Context) {
 
@@ -25,13 +27,17 @@ class BleClient(private val context: Context) {
     }
 
     private var gatt: BluetoothGatt? = null
+    private var pendingSubscribeChar: BluetoothGattCharacteristic? = null
 
     var onConnectionState: ((connected: Boolean) -> Unit)? = null
+    var onConnectionFailed: ((status: Int) -> Unit)? = null
     var onServicesDiscovered: ((services: List<BluetoothGattService>) -> Unit)? = null
     var onCharacteristicUpdate: ((characteristic: BluetoothGattCharacteristic, value: ByteArray) -> Unit)? = null
+    var onDescriptorWrite: ((characteristic: BluetoothGattCharacteristic, success: Boolean) -> Unit)? = null
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        disconnect()
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
@@ -48,31 +54,77 @@ class BleClient(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
+    fun writeCharacteristic(
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+        withoutResponse: Boolean
+    ) {
+        val g = gatt ?: return
+        characteristic.writeType = if (withoutResponse) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+        g.writeCharacteristic(characteristic, value)
+    }
+
+    @SuppressLint("MissingPermission")
     fun subscribeToCharacteristic(characteristic: BluetoothGattCharacteristic) {
         val g = gatt ?: return
+        val props = characteristic.properties
+        val indicate = props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+        val notify = props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+        if (!indicate && !notify) return
         g.setCharacteristicNotification(characteristic, true)
         val descriptor = characteristic.getDescriptor(CCCD_UUID) ?: return
-        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        pendingSubscribeChar = characteristic
+        descriptor.value = if (indicate) {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        }
         g.writeDescriptor(descriptor)
+    }
+
+    private fun runOnMain(block: () -> Unit) {
+        Handler(Looper.getMainLooper()).post(block)
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
 
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Connection error, status=$status")
+                runOnMain { onConnectionFailed?.invoke(status) }
+                return
+            }
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.d(TAG, "Connected, discovering services...")
                 onConnectionState?.invoke(true)
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Disconnected")
-                onConnectionState?.invoke(false)
+                runOnMain { onConnectionState?.invoke(false) }
             }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 onServicesDiscovered?.invoke(g.services)
+            } else {
+                Log.w(TAG, "Service discovery failed, status=$status")
+                runOnMain { onConnectionFailed?.invoke(status) }
+            }
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            val success = status == BluetoothGatt.GATT_SUCCESS
+            Log.d(TAG, "Descriptor write (${descriptor.uuid}) success=$success")
+            val characteristic = pendingSubscribeChar
+            pendingSubscribeChar = null
+            if (characteristic != null) {
+                runOnMain { onDescriptorWrite?.invoke(characteristic, success) }
             }
         }
 

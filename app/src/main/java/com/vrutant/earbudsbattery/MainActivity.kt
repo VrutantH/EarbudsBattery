@@ -11,10 +11,11 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -32,7 +33,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bleClient: BleClient
     private lateinit var prefs: android.content.SharedPreferences
 
+    private val handler = Handler(Looper.getMainLooper())
+
     private var connectedDevice: BluetoothDevice? = null
+    private var userDisconnected = false
+    private var reconnectAttempts = 0
     private val discoveredCharacteristics = mutableListOf<Pair<BluetoothGattService, BluetoothGattCharacteristic>>()
     private val characteristicValues = mutableMapOf<UUID, ByteArray>()
 
@@ -40,13 +45,36 @@ class MainActivity : AppCompatActivity() {
     // saved mapping by its UUID string once you've confirmed it in Explorer.
     private var mappedCharacteristic: BluetoothGattCharacteristic? = null
 
+    // OPO v1 protocol state (realme / OPPO / OnePlus buds)
+    private var opoWriteChar: BluetoothGattCharacteristic? = null
+    private var opoNotifyChar: BluetoothGattCharacteristic? = null
+    private val opoHandshakeRunnable = object : Runnable {
+        override fun run() {
+            val write = opoWriteChar ?: return
+            bleClient.writeCharacteristic(write, OpoBuds.HELLO, true)
+            handler.postDelayed({
+                bleClient.writeCharacteristic(write, OpoBuds.REGISTER, true)
+                handler.postDelayed({
+                    bleClient.writeCharacteristic(write, OpoBuds.QUERY_BATTERY, true)
+                    handler.postDelayed(opoQueryRunnable, OPO_QUERY_INTERVAL_MS)
+                }, OPO_HANDSHAKE_STEP_MS)
+            }, OPO_HANDSHAKE_STEP_MS)
+        }
+    }
+    private val opoQueryRunnable = object : Runnable {
+        override fun run() {
+            opoWriteChar?.let { bleClient.writeCharacteristic(it, OpoBuds.QUERY_BATTERY, true) }
+            handler.postDelayed(this, OPO_QUERY_INTERVAL_MS)
+        }
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         if (results.values.all { it }) {
             loadPairedDevices()
         } else {
-            Toast.makeText(this, "Bluetooth permissions are required to scan for your earbuds", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Bluetooth permissions are required to read your earbuds battery", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -117,11 +145,16 @@ class MainActivity : AppCompatActivity() {
     private fun connectToDevice(device: BluetoothDevice) {
         binding.statusText.text = "Connecting to ${device.name ?: device.address}..."
         connectedDevice = device
+        userDisconnected = false
+        reconnectAttempts = 0
+        stopOpoQuery()
         bleClient.connect(device)
     }
 
     @SuppressLint("MissingPermission")
     private fun disconnectDevice() {
+        userDisconnected = true
+        stopOpoQuery()
         bleClient.disconnect()
         connectedDevice = null
         discoveredCharacteristics.clear()
@@ -131,6 +164,11 @@ class MainActivity : AppCompatActivity() {
         binding.explorerSection.visibility = View.GONE
         binding.dashboardSection.visibility = View.GONE
         binding.statusText.text = "Not connected"
+        loadPairedDevices()
+    }
+
+    private fun handleConnectionFailure(status: Int) {
+        Toast.makeText(this, "Connection failed (status $status). Is the case lid open / are the buds out?", Toast.LENGTH_LONG).show()
         loadPairedDevices()
     }
 
@@ -144,10 +182,28 @@ class MainActivity : AppCompatActivity() {
                     binding.scanSection.visibility = View.GONE
                     binding.modeToggle.visibility = View.VISIBLE
                     showSection(explorer = true)
+                    reportSystemBattery()
                 } else {
-                    binding.statusText.text = "Disconnected"
+                    if (!userDisconnected && connectedDevice != null && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                        reconnectAttempts++
+                        binding.statusText.text = "Disconnected — reconnecting (attempt $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS)..."
+                        handler.postDelayed({
+                            connectedDevice?.let { bleClient.connect(it) }
+                        }, RECONNECT_DELAY_MS)
+                    } else {
+                        binding.statusText.text = "Disconnected"
+                        binding.scanSection.visibility = View.VISIBLE
+                        binding.modeToggle.visibility = View.GONE
+                        binding.explorerSection.visibility = View.GONE
+                        binding.dashboardSection.visibility = View.GONE
+                        loadPairedDevices()
+                    }
                 }
             }
+        }
+
+        bleClient.onConnectionFailed = { status ->
+            runOnUiThread { handleConnectionFailure(status) }
         }
 
         bleClient.onServicesDiscovered = { services ->
@@ -172,7 +228,12 @@ class MainActivity : AppCompatActivity() {
                         bleClient.subscribeToCharacteristic(characteristic)
                     }
                 }
-                reapplyMappedSubscriptionIfNeeded()
+
+                if (!trySetupOpoProtocol(services)) {
+                    if (!trySetupStandardBatteryService(services)) {
+                        reapplyMappedSubscriptionIfNeeded()
+                    }
+                }
             }
         }
 
@@ -181,9 +242,97 @@ class MainActivity : AppCompatActivity() {
                 characteristicValues[characteristic.uuid] = value
                 binding.characteristicList.adapter?.notifyDataSetChanged()
 
+                // OPO battery response (realme/OPPO/OnePlus)
+                if (characteristic.uuid == opoNotifyChar?.uuid) {
+                    OpoBuds.parseBatteryResponse(value)?.let { updateDashboardFromMap(it) }
+                    return@runOnUiThread
+                }
+
+                // Standard Battery Service (0x180F / 0x2A19)
+                if (isStandardBatteryCharacteristic(characteristic.uuid)) {
+                    if (value.isNotEmpty()) {
+                        updateDashboardFromMap(mapOf(1 to (value[0].toInt() and 0xFF), 2 to (value[0].toInt() and 0xFF)))
+                    }
+                    return@runOnUiThread
+                }
+
                 if (mappedCharacteristic?.uuid == characteristic.uuid) {
                     updateDashboard(value)
                 }
+            }
+        }
+    }
+
+    // ---------- OPO v1 protocol (realme / OPPO / OnePlus TWS) ----------
+
+    @SuppressLint("MissingPermission")
+    private fun trySetupOpoProtocol(services: List<BluetoothGattService>): Boolean {
+        val opoService = services.firstOrNull { OpoBuds.isOpoService(it) } ?: return false
+        val write = OpoBuds.findWriteCharacteristic(opoService)
+        val notify = OpoBuds.findNotifyCharacteristic(opoService)
+        if (write == null || notify == null) return false
+
+        opoWriteChar = write
+        opoNotifyChar = notify
+        binding.statusText.text =
+            "Connected — OPO battery protocol detected (realme/OPPO/OnePlus). Subscribing and querying battery..."
+        showSection(explorer = false)
+        bleClient.subscribeToCharacteristic(notify)
+
+        handler.removeCallbacks(opoHandshakeRunnable)
+        handler.removeCallbacks(opoQueryRunnable)
+        handler.postDelayed(opoHandshakeRunnable, OPO_SUBSCRIBE_GRACE_MS)
+        return true
+    }
+
+    private fun stopOpoQuery() {
+        handler.removeCallbacks(opoHandshakeRunnable)
+        handler.removeCallbacks(opoQueryRunnable)
+        opoWriteChar = null
+        opoNotifyChar = null
+    }
+
+    private fun updateDashboardFromMap(battery: Map<Int, Int>) {
+        battery[OpoBuds.ID_LEFT]?.let {
+            binding.leftBar.progress = it
+            binding.leftLabel.text = "$it %"
+        }
+        battery[OpoBuds.ID_RIGHT]?.let {
+            binding.rightBar.progress = it
+            binding.rightLabel.text = "$it %"
+        }
+        battery[OpoBuds.ID_CASE]?.let {
+            binding.caseBar.progress = it
+            binding.caseLabel.text = "$it %"
+        }
+    }
+
+    // ---------- Standard Battery Service (0x180F / 0x2A19) ----------
+
+    private val STANDARD_BATTERY_SERVICE_UUID: UUID =
+        UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+    private val STANDARD_BATTERY_LEVEL_UUID: UUID =
+        UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+
+    private fun isStandardBatteryCharacteristic(uuid: UUID): Boolean =
+        uuid == STANDARD_BATTERY_LEVEL_UUID
+
+    @SuppressLint("MissingPermission")
+    private fun trySetupStandardBatteryService(services: List<BluetoothGattService>): Boolean {
+        val levelChar = services.firstOrNull { it.uuid == STANDARD_BATTERY_SERVICE_UUID }
+            ?.getCharacteristic(STANDARD_BATTERY_LEVEL_UUID) ?: return false
+        binding.statusText.text =
+            "Connected — standard Battery Service found (left/right reflect the system reading)."
+        bleClient.readCharacteristic(levelChar)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun reportSystemBattery() {
+        connectedDevice?.let { device ->
+            val level = device.getBatteryLevel()
+            if (level >= 0) {
+                binding.statusText.text = "Connected — system reports buds battery: $level%"
             }
         }
     }
@@ -195,7 +344,7 @@ class MainActivity : AppCompatActivity() {
         binding.dashboardSection.visibility = if (explorer) View.GONE else View.VISIBLE
     }
 
-    // ---------- Dashboard mapping ----------
+    // ---------- Dashboard mapping (legacy / other earbuds) ----------
 
     private fun restoreSavedMapping() {
         val uuid = prefs.getString("mapped_uuid", null) ?: return
@@ -244,25 +393,32 @@ class MainActivity : AppCompatActivity() {
         fun byteOrNull(index: Int): Int? =
             if (index in value.indices) value[index].toInt() and 0xFF else null
 
-        byteOrNull(leftByte)?.let {
-            val pct = it.coerceIn(0, 100)
+        // realme/OPPO/OnePlus legacy packets use bit 7 as a "charging" flag,
+        // so a value like 0xB2 means 50% + charging. Mask it off.
+        fun decode(b: Int): Pair<Int, Boolean> =
+            (b and 0x7F).coerceIn(0, 100) to (b and 0x80 != 0)
+
+        byteOrNull(leftByte)?.let { raw ->
+            val (pct, charging) = decode(raw)
             binding.leftBar.progress = pct
-            binding.leftLabel.text = "$pct %"
+            binding.leftLabel.text = if (charging) "$pct % (charging)" else "$pct %"
         }
-        byteOrNull(rightByte)?.let {
-            val pct = it.coerceIn(0, 100)
+        byteOrNull(rightByte)?.let { raw ->
+            val (pct, charging) = decode(raw)
             binding.rightBar.progress = pct
-            binding.rightLabel.text = "$pct %"
+            binding.rightLabel.text = if (charging) "$pct % (charging)" else "$pct %"
         }
-        byteOrNull(caseByte)?.let {
-            val pct = it.coerceIn(0, 100)
+        byteOrNull(caseByte)?.let { raw ->
+            val (pct, charging) = decode(raw)
             binding.caseBar.progress = pct
-            binding.caseLabel.text = "$pct %"
+            binding.caseLabel.text = if (charging) "$pct % (charging)" else "$pct %"
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        stopOpoQuery()
+        handler.removeCallbacksAndMessages(null)
         bleClient.disconnect()
     }
 
@@ -330,5 +486,13 @@ class MainActivity : AppCompatActivity() {
             if (props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) list.add("INDICATE")
             return if (list.isEmpty()) "no read/write/notify" else list.joinToString(", ")
         }
+    }
+
+    companion object {
+        private const val OPO_HANDSHAKE_STEP_MS = 1500L
+        private const val OPO_SUBSCRIBE_GRACE_MS = 1000L
+        private const val OPO_QUERY_INTERVAL_MS = 30_000L
+        private const val MAX_RECONNECT_ATTEMPTS = 3
+        private const val RECONNECT_DELAY_MS = 3000L
     }
 }
