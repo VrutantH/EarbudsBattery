@@ -60,12 +60,13 @@ class BleClient(private val context: Context) {
         withoutResponse: Boolean
     ) {
         val g = gatt ?: return
+        characteristic.value = value
         characteristic.writeType = if (withoutResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
-        g.writeCharacteristic(characteristic, value)
+        g.writeCharacteristic(characteristic)
     }
 
     @SuppressLint("MissingPermission")

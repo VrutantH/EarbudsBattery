@@ -182,7 +182,6 @@ class MainActivity : AppCompatActivity() {
                     binding.scanSection.visibility = View.GONE
                     binding.modeToggle.visibility = View.VISIBLE
                     showSection(explorer = true)
-                    reportSystemBattery()
                 } else {
                     if (!userDisconnected && connectedDevice != null && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                         reconnectAttempts++
@@ -325,16 +324,6 @@ class MainActivity : AppCompatActivity() {
             "Connected — standard Battery Service found (left/right reflect the system reading)."
         bleClient.readCharacteristic(levelChar)
         return true
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun reportSystemBattery() {
-        connectedDevice?.let { device ->
-            val level = device.getBatteryLevel()
-            if (level >= 0) {
-                binding.statusText.text = "Connected — system reports buds battery: $level%"
-            }
-        }
     }
 
     // ---------- Section switching ----------

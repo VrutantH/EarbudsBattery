@@ -38,10 +38,10 @@ The app detects this automatically — no manual configuration needed.
 1. Push this repository to GitHub (or any git host running Actions).
 2. On GitHub: **Actions → "Build APK" → Run workflow** (it also runs
    automatically on every push to `main`).
-3. When the job finishes, open the run and download the **earbuds-battery-apk**
-   artifact. It contains `app-debug.apk` and `app-release.apk`.
+3. When the job finishes, open the run and download the **EarbudsBattery-debug-apk**
+   artifact. It contains `app-debug.apk`.
 4. Install the APK on your phone (enable "Install unknown apps" for your file
-   manager). The release APK is unsigned but installs fine on any phone.
+   manager).
 
 The workflow file is `.github/workflows/build.yml`. It needs no secrets.
 
